@@ -10,11 +10,43 @@ import {
   resumeFeedbackPrompt,
 } from './prompts/index.js';
 import { searchJobsTool, searchJobsHandler } from './tools/index.js';
+import {
+  getResourceMetadata,
+  getAuthServerMetadata,
+  registerClient,
+  createAuthCode,
+  exchangeCode,
+  verifyToken,
+  clients,
+} from './oauth.js';
 
 // Environment configuration
-const PORT = process.env.JOBSPY_PORT || 9423;
+// Railway provides PORT; fall back to JOBSPY_PORT then default.
+const PORT = process.env.PORT || process.env.JOBSPY_PORT || 9423;
 const HOST = process.env.JOBSPY_HOST || '0.0.0.0';
 const ENABLE_SSE = !!(process.env.ENABLE_SSE | 0);
+const BASE_URL = process.env.BASE_URL || `http://${HOST}:${PORT}`;
+// OAuth can be disabled for local stdio/dev use.
+const ENABLE_OAUTH = process.env.ENABLE_OAUTH !== '0';
+
+// Bearer-token guard for protected MCP endpoints.
+function requireAuth(req, res, next) {
+  if (!ENABLE_OAUTH) return next();
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith('Bearer ')) {
+    res.set(
+      'WWW-Authenticate',
+      `Bearer realm="mcp", resource_metadata="${BASE_URL}/.well-known/oauth-protected-resource"`,
+    );
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  const payload = verifyToken(auth.slice(7));
+  if (!payload) {
+    return res.status(401).json({ error: 'invalid_token' });
+  }
+  req.auth = payload;
+  next();
+}
 
 // Create the MCP server
 const server = new McpServer({
@@ -56,13 +88,98 @@ async function runServer() {
         app.use(express.json());
         app.use(express.urlencoded({ extended: true }));
 
+        // ── OAuth 2.1 endpoints (required by claude.ai web) ──────
+        if (ENABLE_OAUTH) {
+          // Protected resource metadata (RFC 9728)
+          app.get('/.well-known/oauth-protected-resource', (req, res) => {
+            res.json(getResourceMetadata(BASE_URL));
+          });
+
+          // Authorization server metadata (RFC 8414)
+          app.get('/.well-known/oauth-authorization-server', (req, res) => {
+            res.json(getAuthServerMetadata(BASE_URL));
+          });
+
+          // Dynamic client registration (RFC 7591)
+          app.post('/register', (req, res) => {
+            const clientId = registerClient(req.body || {});
+            res.status(201).json({
+              client_id: clientId,
+              client_id_issued_at: Math.floor(Date.now() / 1000),
+              redirect_uris: (req.body && req.body.redirect_uris) || [],
+              grant_types: ['authorization_code'],
+              response_types: ['code'],
+              token_endpoint_auth_method: 'none',
+            });
+          });
+
+          // Authorization endpoint — auto-approves (personal use)
+          app.get('/authorize', (req, res) => {
+            const {
+              client_id,
+              redirect_uri,
+              code_challenge,
+              code_challenge_method,
+              state,
+              scope,
+            } = req.query;
+
+            if (!client_id || !clients.has(client_id)) {
+              return res.status(400).json({ error: 'invalid_client' });
+            }
+            if (code_challenge_method !== 'S256') {
+              return res.status(400).json({
+                error: 'invalid_request',
+                error_description: 'Only S256 PKCE is supported',
+              });
+            }
+            if (!redirect_uri) {
+              return res.status(400).json({ error: 'invalid_request' });
+            }
+
+            const code = createAuthCode(
+              client_id,
+              redirect_uri,
+              code_challenge,
+              scope,
+            );
+            const redirectUrl = new URL(redirect_uri);
+            redirectUrl.searchParams.set('code', code);
+            if (state) redirectUrl.searchParams.set('state', state);
+
+            res.send(`<!DOCTYPE html>
+<html>
+  <head><meta charset="utf-8"><title>JobSpy MCP — Authorizing</title></head>
+  <body style="font-family:sans-serif;text-align:center;padding:2rem">
+    <h2>Authorizing JobSpy MCP Server…</h2>
+    <p>Redirecting back to Claude…</p>
+    <script>window.location.href = ${JSON.stringify(redirectUrl.toString())};</script>
+  </body>
+</html>`);
+          });
+
+          // Token endpoint — exchange auth code for bearer token
+          app.post('/token', (req, res) => {
+            const { code, code_verifier, grant_type } = req.body || {};
+            if (grant_type !== 'authorization_code') {
+              return res.status(400).json({ error: 'unsupported_grant_type' });
+            }
+            const tokenData = exchangeCode(code, code_verifier);
+            if (!tokenData) {
+              return res.status(400).json({ error: 'invalid_grant' });
+            }
+            res.json(tokenData);
+          });
+        }
+        // ── End OAuth ─────────────────────────────────────────────
+
         // Health check endpoint
         app.get('/health', (req, res) => {
           res.status(200).json({ status: 'ok' });
         });
 
         // SSE endpoint for client connections
-        app.get('/sse', async (req, res) => {
+        app.get('/sse', requireAuth, async (req, res) => {
           const transport = sseManager.createTransport('/messages', res);
 
           res.on('close', () => {
@@ -75,7 +192,7 @@ async function runServer() {
         });
 
         // Message handling endpoint
-        app.post('/messages', async (req, res) => {
+        app.post('/messages', requireAuth, async (req, res) => {
           const transport = sseManager.getTransport(req);
 
           if (transport) {
