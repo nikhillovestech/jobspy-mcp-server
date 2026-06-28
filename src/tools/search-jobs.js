@@ -1,6 +1,8 @@
 import logger from '../logger.js';
 import { searchParams } from '../schemas/searchParamsSchema.js';
 import { execSync } from 'node:child_process';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import changeCase from 'change-case-object';
 
@@ -172,8 +174,16 @@ export function searchJobsHandler(params) {
     logger.info('Validated parameters', { validatedParams });
 
     const args = buildCommandArgs(validatedParams);
-    const dockerCmd = process.env.DOCKER_CMD || 'docker';
-    const cmd = `${dockerCmd} run --rm jobspy ${args.join(' ')}`;
+    // Run the JobSpy scraper directly via Python (no Docker required — works on
+    // Railway and other PaaS where docker-in-docker is unavailable).
+    const pythonCmd = process.env.PYTHON_CMD || 'python3';
+    const mainPy =
+      process.env.JOBSPY_MAIN ||
+      path.resolve(
+        path.dirname(fileURLToPath(import.meta.url)),
+        '../../jobspy/main.py'
+      );
+    const cmd = `${pythonCmd} "${mainPy}" ${args.join(' ')}`;
     logger.info(`Spawning process with args: ${cmd}`);
 
     const timeout = params.timeout || 60000; // Default timeout of 60 seconds
